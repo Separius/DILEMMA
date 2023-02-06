@@ -6,6 +6,7 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MoCo(nn.Module):
@@ -13,7 +14,9 @@ class MoCo(nn.Module):
     Build a MoCo model with a base encoder, a momentum encoder, and two MLPs
     https://arxiv.org/abs/1911.05722
     """
-    def __init__(self, base_encoder, dim=256, mlp_dim=4096, T=1.0):
+
+    def __init__(self, base_encoder, dim=256, mlp_dim=4096, T=1.0,
+                 dilemma_probability=0.0, token_drop_rate=0.0, dilemma_lambda=1.0):
         """
         dim: feature dimension (default: 256)
         mlp_dim: hidden dimension in MLPs (default: 4096)
@@ -22,10 +25,16 @@ class MoCo(nn.Module):
         super(MoCo, self).__init__()
 
         self.T = T
+        self.dilemma_probability = dilemma_probability
+        self.token_drop_rate = token_drop_rate
+        self.dilemma_lambda = dilemma_lambda
 
         # build encoders
         self.base_encoder = base_encoder(num_classes=mlp_dim)
         self.momentum_encoder = base_encoder(num_classes=mlp_dim)
+
+        if dilemma_probability != 0.0:
+            self.dilemma_head = nn.Linear(self.base_encoder.embed_dim, 1)
 
         self._build_projector_and_predictor_mlps(dim, mlp_dim)
 
@@ -72,6 +81,39 @@ class MoCo(nn.Module):
         labels = (torch.arange(N, dtype=torch.long) + N * torch.distributed.get_rank()).cuda()
         return nn.CrossEntropyLoss()(logits, labels) * (2 * self.T)
 
+    def get_pos(self, x, return_other_indices=False):
+        N = x.size(0)
+        L = self.base_encoder.patch_embed.num_patches
+        len_keep = int(L * (1.0 - self.token_drop_rate))
+        noise = torch.rand(N, L, device=x.device)
+        ids_shuffle = torch.argsort(noise, dim=1)
+        x_pos = ids_shuffle[:, :len_keep]
+        if return_other_indices:
+            return x_pos, ids_shuffle
+        return x_pos
+
+    def call_encoder(self, x):
+        if self.dilemma_probability == 0.0:
+            input_pos = None
+            if self.token_drop_rate == 0.0:
+                real_pos = None
+            else:  # sparse, no dilemma
+                real_pos = self.get_pos(x)
+        else:
+            real_pos, ids_shuffle = self.get_pos(x, return_other_indices=True)
+            len_keep = real_pos.size(1)
+            token_labels = torch.rand(real_pos.size(0), len_keep, device=x.device) < self.dilemma_probability
+            if len_keep != x.size(1):
+                noise = ids_shuffle[:, -len_keep:]
+            else:
+                noise = torch.flip(ids_shuffle, dims=[1])
+            input_pos = torch.where(token_labels, noise, real_pos)
+        cls, tokens = self.base_encoder(x, real_pos, input_pos)
+        cls = self.predictor(cls)
+        if self.dilemma_probability == 0.0:
+            return cls, None
+        return cls, F.binary_cross_entropy_with_logits(self.dilemma_head(tokens).squeeze(2), token_labels.float())
+
     def forward(self, x1, x2, m):
         """
         Input:
@@ -81,38 +123,25 @@ class MoCo(nn.Module):
         Output:
             loss
         """
-
-        # compute features
-        q1 = self.predictor(self.base_encoder(x1))
-        q2 = self.predictor(self.base_encoder(x2))
-
         with torch.no_grad():  # no gradient
             self._update_momentum_encoder(m)  # update the momentum encoder
-
             # compute momentum features as targets
-            k1 = self.momentum_encoder(x1)
-            k2 = self.momentum_encoder(x2)
+            k1, _ = self.momentum_encoder(x1)  # dense
+            k2, _ = self.momentum_encoder(x2)
 
-        return self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
-
-
-class MoCo_ResNet(MoCo):
-    def _build_projector_and_predictor_mlps(self, dim, mlp_dim):
-        hidden_dim = self.base_encoder.fc.weight.shape[1]
-        del self.base_encoder.fc, self.momentum_encoder.fc # remove original fc layer
-
-        # projectors
-        self.base_encoder.fc = self._build_mlp(2, hidden_dim, mlp_dim, dim)
-        self.momentum_encoder.fc = self._build_mlp(2, hidden_dim, mlp_dim, dim)
-
-        # predictor
-        self.predictor = self._build_mlp(2, dim, mlp_dim, dim, False)
+        # compute features
+        q1, dilemma_loss1 = self.call_encoder(x1)
+        q2, dilemma_loss2 = self.call_encoder(x2)
+        con_loss = self.contrastive_loss(q1, k2) + self.contrastive_loss(q2, k1)
+        if self.dilemma_probability == 0.0:
+            con_loss
+        return con_loss + self.dilemma_lambda * (dilemma_loss1 + dilemma_loss2) / 2.0
 
 
 class MoCo_ViT(MoCo):
     def _build_projector_and_predictor_mlps(self, dim, mlp_dim):
         hidden_dim = self.base_encoder.head.weight.shape[1]
-        del self.base_encoder.head, self.momentum_encoder.head # remove original fc layer
+        del self.base_encoder.head, self.momentum_encoder.head  # remove original fc layer
 
         # projectors
         self.base_encoder.head = self._build_mlp(3, hidden_dim, mlp_dim, dim)
@@ -130,7 +159,7 @@ def concat_all_gather(tensor):
     *** Warning ***: torch.distributed.all_gather has no gradient.
     """
     tensors_gather = [torch.ones_like(tensor)
-        for _ in range(torch.distributed.get_world_size())]
+                      for _ in range(torch.distributed.get_world_size())]
     torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
 
     output = torch.cat(tensors_gather, dim=0)

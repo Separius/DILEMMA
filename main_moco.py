@@ -17,7 +17,6 @@ import warnings
 from functools import partial
 
 import torch
-import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -27,7 +26,6 @@ import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
-import torchvision.models as torchvision_models
 from torch.utils.tensorboard import SummaryWriter
 
 import moco.builder
@@ -36,12 +34,7 @@ import moco.optimizer
 
 import vits
 
-
-torchvision_model_names = sorted(name for name in torchvision_models.__dict__
-    if name.islower() and not name.startswith("__")
-    and callable(torchvision_models.__dict__[name]))
-
-model_names = ['vit_small', 'vit_base', 'vit_conv_small', 'vit_conv_base'] + torchvision_model_names
+model_names = ['vit_small', 'vit_base']
 
 parser = argparse.ArgumentParser(description='MoCo ImageNet Pre-Training')
 parser.add_argument('data', metavar='DIR',
@@ -49,8 +42,8 @@ parser.add_argument('data', metavar='DIR',
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet50',
                     choices=model_names,
                     help='model architecture: ' +
-                        ' | '.join(model_names) +
-                        ' (default: resnet50)')
+                         ' | '.join(model_names) +
+                         ' (default: resnet50)')
 parser.add_argument('-j', '--workers', default=32, type=int, metavar='N',
                     help='number of data loading workers (default: 32)')
 parser.add_argument('--epochs', default=100, type=int, metavar='N',
@@ -117,6 +110,11 @@ parser.add_argument('--warmup-epochs', default=10, type=int, metavar='N',
 parser.add_argument('--crop-min', default=0.08, type=float,
                     help='minimum scale for random cropping (default: 0.08)')
 
+# DILEMMA
+parser.add_argument('--dilemma_probability', default=0.0, type=float, help='0.0 to disable')
+parser.add_argument('--dilemma_lambda', default=1.0, type=float, help='loss weight for dilemma')
+parser.add_argument('--token_drop_rate', default=0.0, type=float, help='0.0 to disable (aka Dense)')
+
 
 def main():
     args = parser.parse_args()
@@ -160,6 +158,7 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.multiprocessing_distributed and (args.gpu != 0 or args.rank != 0):
         def print_pass(*args):
             pass
+
         builtins.print = print_pass
 
     if args.gpu is not None:
@@ -177,14 +176,9 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.distributed.barrier()
     # create model
     print("=> creating model '{}'".format(args.arch))
-    if args.arch.startswith('vit'):
-        model = moco.builder.MoCo_ViT(
-            partial(vits.__dict__[args.arch], stop_grad_conv1=args.stop_grad_conv1),
-            args.moco_dim, args.moco_mlp_dim, args.moco_t)
-    else:
-        model = moco.builder.MoCo_ResNet(
-            partial(torchvision_models.__dict__[args.arch], zero_init_residual=True), 
-            args.moco_dim, args.moco_mlp_dim, args.moco_t)
+    model = moco.builder.MoCo_ViT(
+        partial(vits.__dict__[args.arch], stop_grad_conv1=args.stop_grad_conv1), args.moco_dim,
+        args.moco_mlp_dim, args.moco_t, args.dilemma_probability, args.token_drop_rate, args.dilemma_lambda)
 
     # infer learning rate before changing batch size
     args.lr = args.lr * args.batch_size / 256
@@ -219,16 +213,14 @@ def main_worker(gpu, ngpus_per_node, args):
     else:
         # AllGather/rank implementation in this code only supports DistributedDataParallel.
         raise NotImplementedError("Only DistributedDataParallel is supported.")
-    print(model) # print model after SyncBatchNorm
+    print(model)  # print model after SyncBatchNorm
 
     if args.optimizer == 'lars':
         optimizer = moco.optimizer.LARS(model.parameters(), args.lr,
-                                        weight_decay=args.weight_decay,
-                                        momentum=args.momentum)
+                                        weight_decay=args.weight_decay, momentum=args.momentum)
     elif args.optimizer == 'adamw':
-        optimizer = torch.optim.AdamW(model.parameters(), args.lr,
-                                weight_decay=args.weight_decay)
-        
+        optimizer = torch.optim.AdamW(model.parameters(), args.lr, weight_decay=args.weight_decay)
+
     scaler = torch.cuda.amp.GradScaler()
     summary_writer = SummaryWriter() if args.rank == 0 else None
 
@@ -286,7 +278,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_dataset = datasets.ImageFolder(
         traindir,
-        moco.loader.TwoCropsTransform(transforms.Compose(augmentation1), 
+        moco.loader.TwoCropsTransform(transforms.Compose(augmentation1),
                                       transforms.Compose(augmentation2)))
 
     if args.distributed:
@@ -306,17 +298,18 @@ def main_worker(gpu, ngpus_per_node, args):
         train(train_loader, model, optimizer, scaler, summary_writer, epoch, args)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank == 0): # only the first GPU saves checkpoint
+                                                    and args.rank == 0):  # only the first GPU saves checkpoint
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
                 'state_dict': model.state_dict(),
-                'optimizer' : optimizer.state_dict(),
+                'optimizer': optimizer.state_dict(),
                 'scaler': scaler.state_dict(),
             }, is_best=False, filename='checkpoint_%04d.pth.tar' % epoch)
 
     if args.rank == 0:
         summary_writer.close()
+
 
 def train(train_loader, model, optimizer, scaler, summary_writer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
@@ -378,6 +371,7 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
+
     def __init__(self, name, fmt=':f'):
         self.name = name
         self.fmt = fmt
@@ -420,9 +414,10 @@ class ProgressMeter(object):
 def adjust_learning_rate(optimizer, epoch, args):
     """Decays the learning rate with half-cycle cosine after warmup"""
     if epoch < args.warmup_epochs:
-        lr = args.lr * epoch / args.warmup_epochs 
+        lr = args.lr * epoch / args.warmup_epochs
     else:
-        lr = args.lr * 0.5 * (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
+        lr = args.lr * 0.5 * (
+                1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     return lr
